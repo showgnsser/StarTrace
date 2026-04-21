@@ -6,347 +6,195 @@
 * @date           : 2026/4/19
 ******************************************************************************
 */
+/*
+******************************************************************************
+* @file           : B1ISignalModulator.cpp
+******************************************************************************
+*/
 #include "B1ISignalModulator.h"
-#include "AwgnGenerator.h"
-#include "FrontendFilter.h"
-#include <algorithm>
 #include <cmath>
-#include <stdexcept>
 
 namespace startrace {
 namespace signal {
 
-namespace {
-    constexpr double TWO_PI = 2.0 * M_PI;
-
-    inline void wrapPhase(double& phase) {
-        // 仅在幅度过大时归一化，减小 fmod 调用次数
-        if (phase > 1e6 || phase < -1e6) {
-            phase = std::fmod(phase, TWO_PI);
-        }
-    }
-}
-
-// ============================== 构造 ==============================
-B1ISignalModulator::B1ISignalModulator(uint8_t prn, double sample_rate, BdsMessageType message_type)
-    : m_prn(prn)
-    , m_sampleRate(sample_rate)
-    , m_codePhase(0.0)
-    , m_carrierPhase(0.0)
-    , m_prnPeriodCount(0)
-    , m_sampleCount(0)
-    , m_messageType(message_type)
-    , m_navBitGen(std::make_unique<B1INavBitGenerator>(prn, message_type))
+B1ISignalModulator::B1ISignalModulator(const SignalConfigB1I& config)
+    : m_config(config)
+    , m_navBitGen(config.prn_number, config.message_type)
+    , m_filter_I(1.0, 0.0, 0.0, 0.0, 0.0) // 初始化 I 路滤波器
+    , m_filter_Q(1.0, 0.0, 0.0, 0.0, 0.0) // 初始化 Q 路滤波器
+    , m_noiseGen(config.noise_seed)
 {
-    if (prn < PrnCodeB1I::MIN_PRN || prn > PrnCodeB1I::MAX_PRN)
-        throw std::invalid_argument("PRN number out of valid range");
-    if (sample_rate <= 0)
-        throw std::invalid_argument("Sample rate must be positive");
+    m_prnCode = PrnCodeB1I::generate(m_config.prn_number);
+    m_dt = 1.0 / m_config.sample_rate_hz;
+    m_baseCodeStep = SignalConfigB1I::CODE_RATE_CPS * m_dt;
 
-    m_prnCode = PrnCodeB1I::generate(prn);
+    initFilter();
+    reset();
 }
 
-// ============================== 一步式生成接口 ==============================
-SignalOutput B1ISignalModulator::generateSignal(const SignalConfigB1I& cfg) {
-    // 采样率一致性
-    m_sampleRate = cfg.sample_rate_hz;
-
-    // 电文类型同步
-    if (cfg.message_type != m_messageType) {
-        m_messageType = cfg.message_type;
-        m_navBitGen->setMessageType(cfg.message_type, /*regenerate_random=*/false);
-    }
-
-    SignalOutput out;
-    out.mode           = cfg.output_mode;
-    out.format         = cfg.sample_format;
-    out.sample_rate_hz = cfg.sample_rate_hz;
-    out.cn0_dbhz       = cfg.cn0_dbhz;
-    out.num_samples    = cfg.getTotalSamples();
-    out.signal_power   = cfg.getSignalPower();
-
-    // 1) 生成纯净信号
-    std::vector<std::complex<float>> buf_c;
-    std::vector<float>               buf_r;
-    if (cfg.output_mode == OutputMode::COMPLEX_BASEBAND) {
-        generateCleanComplex(cfg, buf_c);
-    } else {
-        generateCleanReal(cfg, buf_r);
-    }
-
-    // 2) 前端带宽滤波（在噪声之前：只滤信号；若希望滤"信号+噪声"把顺序调换）
-    if (cfg.enable_frontend_filter) {
-        if (cfg.output_mode == OutputMode::COMPLEX_BASEBAND) {
-            FrontendFilter::applyLowpassComplex(buf_c, cfg.sample_rate_hz,
-                                                cfg.frontend_bandwidth_hz);
-        } else {
-            FrontendFilter::applyBandpassReal(buf_r, cfg.sample_rate_hz,
-                                              cfg.intermediate_freq_hz,
-                                              cfg.frontend_bandwidth_hz);
-        }
-    }
-
-    // 3) 添加AWGN噪声（基于CN0）
-    double sigma = 0.0;
-    if (cfg.enable_noise) {
-        AwgnGenerator noise(cfg.noise_seed);
-        if (cfg.output_mode == OutputMode::COMPLEX_BASEBAND) {
-            sigma = noise.addNoiseComplex(buf_c, out.signal_power,
-                                          cfg.cn0_dbhz, cfg.sample_rate_hz);
-        } else {
-            sigma = noise.addNoiseReal(buf_r, out.signal_power,
-                                       cfg.cn0_dbhz, cfg.sample_rate_hz);
-        }
-    }
-    out.noise_sigma = sigma;
-
-    // 4) 量化/输出
-    if (cfg.output_mode == OutputMode::COMPLEX_BASEBAND) {
-        if (cfg.sample_format == SampleFormat::FLOAT32) {
-            out.complex_samples = std::move(buf_c);
-        } else {
-            // 满量程：A + N*sigma（以标准差倍数估计）
-            double full_scale = cfg.signal_amplitude
-                              + cfg.quantize_full_scale * std::max(sigma, 1e-12);
-            quantizeComplex(buf_c, out, full_scale);
-        }
-    } else {
-        if (cfg.sample_format == SampleFormat::FLOAT32) {
-            out.real_samples = std::move(buf_r);
-        } else {
-            double full_scale = cfg.signal_amplitude
-                              + cfg.quantize_full_scale * std::max(sigma, 1e-12);
-            quantizeReal(buf_r, out, full_scale);
-        }
-    }
-
-    return out;
-}
-
-// ============================== 核心：纯净复基带 ==============================
-void B1ISignalModulator::generateCleanComplex(const SignalConfigB1I& cfg,
-                                              std::vector<std::complex<float>>& out)
-{
-    const size_t N  = cfg.getTotalSamples();
-    const double fs = cfg.sample_rate_hz;
-    const double dt = 1.0 / fs;
-    const double A  = cfg.signal_amplitude;
-
-    out.assign(N, std::complex<float>(0.0f, 0.0f));
-
-    m_codePhase      = cfg.initial_code_phase_chips;
-    m_carrierPhase   = cfg.initial_carrier_phase_rad;
-    m_prnPeriodCount = 0;
-    m_sampleCount    = 0;
-
-    const double base_code_step = CODE_RATE_HZ / fs;
-
-    for (size_t i = 0; i < N; ++i) {
-        const double t = (double)i * dt;
-
-        int8_t chip = getPrnChip(m_codePhase);
-        int8_t mod  = m_navBitGen->getModulationValue(m_prnPeriodCount);
-        double baseband = A * static_cast<double>(chip * mod);
-
-        // 基带只含多普勒（瞬时）
-        double fd = cfg.doppler_freq_hz + cfg.doppler_rate_hz_per_s * t;
-
-        out[i] = std::complex<float>(
-            static_cast<float>(baseband * std::cos(m_carrierPhase)),
-            static_cast<float>(baseband * std::sin(m_carrierPhase))
-        );
-
-        // 相位积分
-        m_carrierPhase += TWO_PI * fd * dt;
-        wrapPhase(m_carrierPhase);
-
-        // 码相位随多普勒按载波比例缩放
-        double code_step = base_code_step * (1.0 + fd / CARRIER_FREQ_HZ);
-        m_codePhase += code_step;
-        while (m_codePhase >= (double)CODE_LENGTH) {
-            m_codePhase -= (double)CODE_LENGTH;
-            ++m_prnPeriodCount;
-        }
-        ++m_sampleCount;
-    }
-}
-
-// ============================== 核心：纯净实中频 ==============================
-void B1ISignalModulator::generateCleanReal(const SignalConfigB1I& cfg,
-                                           std::vector<float>& out)
-{
-    const size_t N  = cfg.getTotalSamples();
-    const double fs = cfg.sample_rate_hz;
-    const double dt = 1.0 / fs;
-    const double A  = cfg.signal_amplitude;
-    const double fIF = cfg.intermediate_freq_hz;
-
-    out.assign(N, 0.0f);
-
-    m_codePhase      = cfg.initial_code_phase_chips;
-    m_carrierPhase   = cfg.initial_carrier_phase_rad;
-    m_prnPeriodCount = 0;
-    m_sampleCount    = 0;
-
-    const double base_code_step = CODE_RATE_HZ / fs;
-
-    for (size_t i = 0; i < N; ++i) {
-        const double t = (double)i * dt;
-
-        int8_t chip = getPrnChip(m_codePhase);
-        int8_t mod  = m_navBitGen->getModulationValue(m_prnPeriodCount);
-        double baseband = A * static_cast<double>(chip * mod);
-
-        // 实中频：f_total = f_IF + f_doppler(t)
-        double fd = cfg.doppler_freq_hz + cfg.doppler_rate_hz_per_s * t;
-        double f_total = fIF + fd;
-
-        out[i] = static_cast<float>(baseband * std::cos(m_carrierPhase));
-
-        m_carrierPhase += TWO_PI * f_total * dt;
-        wrapPhase(m_carrierPhase);
-
-        double code_step = base_code_step * (1.0 + fd / CARRIER_FREQ_HZ);
-        m_codePhase += code_step;
-        while (m_codePhase >= (double)CODE_LENGTH) {
-            m_codePhase -= (double)CODE_LENGTH;
-            ++m_prnPeriodCount;
-        }
-        ++m_sampleCount;
-    }
-}
-
-// ============================== 量化 ==============================
-void B1ISignalModulator::quantizeComplex(const std::vector<std::complex<float>>& in,
-                                         SignalOutput& out, double full_scale)
-{
-    const size_t N = in.size();
-    const double inv_fs = 1.0 / std::max(full_scale, 1e-12);
-
-    if (out.format == SampleFormat::INT16) {
-        out.complex_samples_i16.resize(2 * N);
-        const double k = 32767.0 * inv_fs;
-        for (size_t i = 0; i < N; ++i) {
-            double qi = std::max(-32768.0, std::min(32767.0, in[i].real() * k));
-            double qq = std::max(-32768.0, std::min(32767.0, in[i].imag() * k));
-            out.complex_samples_i16[2 * i]     = static_cast<int16_t>(qi);
-            out.complex_samples_i16[2 * i + 1] = static_cast<int16_t>(qq);
-        }
-    } else if (out.format == SampleFormat::INT8) {
-        out.complex_samples_i8.resize(2 * N);
-        const double k = 127.0 * inv_fs;
-        for (size_t i = 0; i < N; ++i) {
-            double qi = std::max(-128.0, std::min(127.0, in[i].real() * k));
-            double qq = std::max(-128.0, std::min(127.0, in[i].imag() * k));
-            out.complex_samples_i8[2 * i]     = static_cast<int8_t>(qi);
-            out.complex_samples_i8[2 * i + 1] = static_cast<int8_t>(qq);
-        }
-    }
-}
-
-void B1ISignalModulator::quantizeReal(const std::vector<float>& in,
-                                      SignalOutput& out, double full_scale)
-{
-    const size_t N = in.size();
-    const double inv_fs = 1.0 / std::max(full_scale, 1e-12);
-
-    if (out.format == SampleFormat::INT16) {
-        out.real_samples_i16.resize(N);
-        const double k = 32767.0 * inv_fs;
-        for (size_t i = 0; i < N; ++i) {
-            double q = std::max(-32768.0, std::min(32767.0, in[i] * k));
-            out.real_samples_i16[i] = static_cast<int16_t>(q);
-        }
-    } else if (out.format == SampleFormat::INT8) {
-        out.real_samples_i8.resize(N);
-        const double k = 127.0 * inv_fs;
-        for (size_t i = 0; i < N; ++i) {
-            double q = std::max(-128.0, std::min(127.0, in[i] * k));
-            out.real_samples_i8[i] = static_cast<int8_t>(q);
-        }
-    }
-}
-
-// ============================== 旧接口（兼容） ==============================
-std::vector<std::complex<float>> B1ISignalModulator::generate(
-    double duration_sec, double doppler_hz,
-    double code_phase_chips, double carrier_phase_rad)
-{
-    size_t N = static_cast<size_t>(duration_sec * m_sampleRate + 0.5);
-    return generateSamples(N, doppler_hz, code_phase_chips, carrier_phase_rad);
-}
-
-std::vector<std::complex<float>> B1ISignalModulator::generateSamples(
-    size_t num_samples, double doppler_hz,
-    double code_phase_chips, double carrier_phase_rad)
-{
-    m_codePhase      = code_phase_chips;
-    m_carrierPhase   = carrier_phase_rad;
-    m_prnPeriodCount = 0;
-    m_sampleCount    = 0;
-    return generateContinuous(num_samples, doppler_hz);
-}
-
-std::vector<std::complex<float>> B1ISignalModulator::generateContinuous(
-    size_t num_samples, double doppler_hz)
-{
-    std::vector<std::complex<float>> signal(num_samples);
-
-    double doppler_code_rate = CODE_RATE_HZ * (doppler_hz / CARRIER_FREQ_HZ);
-    double code_phase_step   = (CODE_RATE_HZ + doppler_code_rate) / m_sampleRate;
-    double carrier_phase_step = TWO_PI * doppler_hz / m_sampleRate;
-
-    for (size_t i = 0; i < num_samples; ++i) {
-        int8_t chip = getPrnChip(m_codePhase);
-        int8_t mod  = m_navBitGen->getModulationValue(m_prnPeriodCount);
-        double baseband = static_cast<double>(chip * mod);
-
-        signal[i] = std::complex<float>(
-            static_cast<float>(baseband * std::cos(m_carrierPhase)),
-            static_cast<float>(baseband * std::sin(m_carrierPhase))
-        );
-
-        m_codePhase += code_phase_step;
-        while (m_codePhase >= (double)CODE_LENGTH) {
-            m_codePhase -= (double)CODE_LENGTH;
-            ++m_prnPeriodCount;
-        }
-
-        m_carrierPhase += carrier_phase_step;
-        wrapPhase(m_carrierPhase);
-        ++m_sampleCount;
-    }
-    return signal;
-}
-
-// ============================== 其他 ==============================
 void B1ISignalModulator::reset() {
-    m_codePhase      = 0.0;
-    m_carrierPhase   = 0.0;
+    m_codePhase = m_config.initial_code_phase_chips;
+    m_carrierPhase = m_config.initial_carrier_phase_rad;
     m_prnPeriodCount = 0;
-    m_sampleCount    = 0;
+    m_totalSamplesGenerated = 0;
+    m_filter_I.reset();
+    m_filter_Q.reset();
 }
 
-void B1ISignalModulator::setNavBits(const std::vector<uint8_t>& bits) {
-    m_navBitGen->setNavBits(bits);
+inline void B1ISignalModulator::wrapPhase(double& phase) {
+    while (phase >= TWO_PI) phase -= TWO_PI;
+    while (phase < 0.0)     phase += TWO_PI;
 }
 
-void B1ISignalModulator::setMessageType(BdsMessageType message_type) {
-    if (m_messageType != message_type) {
-        m_messageType = message_type;
-        m_navBitGen->setMessageType(message_type, /*regenerate_random=*/false);
+void B1ISignalModulator::initFilter() {
+    if (!m_config.enable_frontend_filter) return;
+
+    double fs = m_config.sample_rate_hz;
+    double fc = m_config.frontend_bandwidth_hz;
+    double wc = std::tan(M_PI * fc / fs);
+    double k  = wc;
+    double q  = 0.7071067811865475; // 1/sqrt(2)
+    double norm = 1.0 / (1.0 + k / q + k * k);
+
+    double b0 = k * k * norm;
+    double b1 = 2.0 * b0;
+    double b2 = b0;
+    double a1 = 2.0 * (k * k - 1.0) * norm;
+    double a2 = (1.0 - k / q + k * k) * norm;
+
+    // 两路滤波器使用相同的巴特沃斯系数
+    m_filter_I = IIRFilter(b0, b1, b2, a1, a2);
+    m_filter_Q = IIRFilter(b0, b1, b2, a1, a2);
+}
+
+void B1ISignalModulator::generateNextChunk(ChunkBuffer& chunk) {
+    if (chunk.data == nullptr || m_config.chunk_size <= 0) return;
+
+    chunk.current_code_phase = m_codePhase;
+    chunk.current_carrier_phase = m_carrierPhase;
+    chunk.num_samples = m_config.chunk_size;
+
+    const double A = m_config.signal_amplitude;
+    const double fIF = m_config.intermediate_freq_hz;
+    const double fc = SignalConfigB1I::CARRIER_FREQ_HZ;
+    const bool isComplex = (m_config.output_mode == OutputMode::COMPLEX_BASEBAND);
+
+    double codePhase = m_codePhase;
+    double carrierPhase = m_carrierPhase;
+    int prnPeriodCount = m_prnPeriodCount;
+    long long t_idx = m_totalSamplesGenerated;
+
+    // =========================================================
+    // 核心分离逻辑：避免在内层循环做条件判断，极大提升运行速度
+    // =========================================================
+    if (isComplex) {
+        // 【复数基带模式】：生成 I/Q 交织序列 [I0, Q0, I1, Q1 ...]
+        for (int i = 0; i < m_config.chunk_size; ++i) {
+            double t = static_cast<double>(t_idx) * m_dt;
+            // 复基带信号不包含中频 fIF，载波频率仅等于多普勒频移
+            double fd = m_config.doppler_freq_hz + m_config.doppler_rate_hz_per_s * t;
+
+            int chip_idx = static_cast<int>(codePhase);
+            if (chip_idx >= SignalConfigB1I::CODE_LENGTH) chip_idx = SignalConfigB1I::CODE_LENGTH - 1;
+
+            int8_t chip = m_prnCode[chip_idx];
+            int8_t nav_mod = m_navBitGen.getModulationValue(prnPeriodCount);
+            double baseband = A * static_cast<double>(chip * nav_mod);
+
+            // S(t) = baseband * exp(j * phi) = I + jQ
+            chunk.data[2 * i]     = static_cast<float>(baseband * std::cos(carrierPhase)); // I 路
+            chunk.data[2 * i + 1] = static_cast<float>(baseband * std::sin(carrierPhase)); // Q 路
+
+            carrierPhase += TWO_PI * fd * m_dt;
+            wrapPhase(carrierPhase);
+
+            double code_step = m_baseCodeStep * (1.0 + fd / fc);
+            codePhase += code_step;
+            while (codePhase >= SignalConfigB1I::CODE_LENGTH) {
+                codePhase -= SignalConfigB1I::CODE_LENGTH;
+                prnPeriodCount++;
+            }
+            t_idx++;
+        }
+    } else {
+        // 【实数中频模式】：单通道序列
+        for (int i = 0; i < m_config.chunk_size; ++i) {
+            double t = static_cast<double>(t_idx) * m_dt;
+            double fd = m_config.doppler_freq_hz + m_config.doppler_rate_hz_per_s * t;
+
+            int chip_idx = static_cast<int>(codePhase);
+            if (chip_idx >= SignalConfigB1I::CODE_LENGTH) chip_idx = SignalConfigB1I::CODE_LENGTH - 1;
+
+            int8_t chip = m_prnCode[chip_idx];
+            int8_t nav_mod = m_navBitGen.getModulationValue(prnPeriodCount);
+            double baseband = A * static_cast<double>(chip * nav_mod);
+
+            // S(t) = baseband * cos(2 * pi * (fIF + fd) * t)
+            double f_total = fIF + fd;
+            chunk.data[i] = static_cast<float>(baseband * std::cos(carrierPhase));
+
+            carrierPhase += TWO_PI * f_total * m_dt;
+            wrapPhase(carrierPhase);
+
+            double code_step = m_baseCodeStep * (1.0 + fd / fc);
+            codePhase += code_step;
+            while (codePhase >= SignalConfigB1I::CODE_LENGTH) {
+                codePhase -= SignalConfigB1I::CODE_LENGTH;
+                prnPeriodCount++;
+            }
+            t_idx++;
+        }
     }
-}
 
-int8_t B1ISignalModulator::getPrnChip(double code_phase) const {
-    double np = code_phase;
-    if (np < 0.0 || np >= (double)CODE_LENGTH) {
-        np = std::fmod(np, (double)CODE_LENGTH);
-        if (np < 0.0) np += (double)CODE_LENGTH;
+    // =========================================================
+    // 5. 应用状态记忆的 IIR 前端滤波器
+    // =========================================================
+    if (m_config.enable_frontend_filter) {
+        if (isComplex) {
+            // 复基带：步长为2，利用偏移分别滤 I 路(offset=0) 和 Q 路(offset=1)
+            m_filter_I.processChunk(chunk.data, m_config.chunk_size, 2, 0);
+            m_filter_Q.processChunk(chunk.data, m_config.chunk_size, 2, 1);
+        } else {
+            // 实中频：普通的连续数组，步长为1
+            m_filter_I.processChunk(chunk.data, m_config.chunk_size, 1, 0);
+        }
     }
-    size_t idx = static_cast<size_t>(std::floor(np));
-    if (idx >= CODE_LENGTH) idx = CODE_LENGTH - 1;
-    return m_prnCode[idx];
+
+    // =========================================================
+    // 6. 叠加 AWGN 噪声
+    // =========================================================
+    if (m_config.enable_noise) {
+        if (isComplex) {
+            // 复基带总信号功率 C = A^2。
+            // 巧合且优雅的数学性质：复基带中 I 和 Q 是两路独立的随机变量。
+            // 我们直接将其视为一个长度为 2*chunk_size 的实数组加入噪声，
+            // AWGN生成器根据 C=A^2 算出的每路方差恰好满足 N0 * fs / 2，逻辑完美自洽！
+            double sig_power = A * A;
+            m_noiseGen.addNoiseRealInPlace(
+                chunk.data,
+                m_config.chunk_size * 2, // 长度翻倍
+                sig_power,
+                m_config.cn0_dbhz,
+                m_config.sample_rate_hz
+            );
+        } else {
+            // 实中频 BPSK 的信号功率 C = A^2 / 2
+            double sig_power = (A * A) / 2.0;
+            m_noiseGen.addNoiseRealInPlace(
+                chunk.data,
+                m_config.chunk_size,
+                sig_power,
+                m_config.cn0_dbhz,
+                m_config.sample_rate_hz
+            );
+        }
+    }
+
+    // 7. 将局部寄存器写回成员变量挂起，等待下一次切片
+    m_codePhase = codePhase;
+    m_carrierPhase = carrierPhase;
+    m_prnPeriodCount = prnPeriodCount;
+    m_totalSamplesGenerated = t_idx;
 }
 
 } // namespace signal

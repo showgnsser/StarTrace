@@ -12,114 +12,89 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <cmath>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 namespace startrace {
 namespace signal {
 
 /**
- * @brief 信号输出模式枚举
+ * @brief 信号输出模式
  */
 enum class OutputMode {
-    REAL_IF,         // 实数中频模式：s(t) = A * c(t) * d(t) * cos(2π(f_IF+f_d)t + φ)
-    COMPLEX_BASEBAND // 复数基带模式：s(t) = A * c(t) * d(t) * exp(j(2π f_d t + φ))
+    REAL_IF,         // 实数中频模式：输出单通道 float 数组 (S = A * cos(...))
+    COMPLEX_BASEBAND // 复数基带模式：输出 I/Q 交织的 float 数组 (S = I + jQ)
 };
 
 /**
- * @brief BDS电文类型枚举
+ * @brief 北斗电文类型
  */
 enum class BdsMessageType {
-    D1,  // MEO/IGSO卫星电文，使用NH码，符号率50sps
-    D2   // GEO卫星电文，不使用NH码，符号率500sps
+    D1,  // MEO/IGSO卫星电文，速率 50 bps，含 NH 码
+    D2   // GEO卫星电文，速率 500 bps，不含 NH 码
 };
 
 /**
- * @brief 输出数据类型（量化位数）
- */
-enum class SampleFormat {
-    FLOAT32,  // 浮点（默认）
-    INT16,    // 16-bit 量化
-    INT8      // 8-bit 量化（贴近真实ADC）
-};
-
-/**
- * @brief B1I信号生成器配置参数
+ * @brief B1I 流式信号生成器配置参数
+ * 采用 C with Class 风格，均为 Plain Old Data，方便在模块间传递。
  */
 struct SignalConfigB1I {
-    // ==================== B1I信号固有参数（不可修改）====================
-    static constexpr double CARRIER_FREQ_HZ = 1561.098e6;    // B1I载波频率
-    static constexpr double CODE_RATE_CPS   = 2.046e6;       // 码速率 (chips/s)
-    static constexpr size_t CODE_LENGTH_CHIPS = 2046;        // PRN码长度
-    static constexpr double CODE_PERIOD_S   = 1.0e-3;        // 码周期 = 1ms
-    static constexpr double D1_SYMBOL_RATE_SPS = 50.0;
-    static constexpr double D2_SYMBOL_RATE_SPS = 500.0;
-    static constexpr size_t NH_CODE_LENGTH  = 20;
+    // ==================== B1I 物理层常数 (不可修改) ====================
+    // B1I 载波标称中心频率 (Hz)
+    static constexpr double CARRIER_FREQ_HZ = 1561.098e6;
+    // B1I 测距码标称码速率 (Chips/sec)
+    static constexpr double CODE_RATE_CPS   = 2.046e6;
+    // B1I 每个 PRN 周期的码片长度 (Chips)
+    static constexpr int    CODE_LENGTH     = 2046;
+    // 合法的 PRN 编号范围
+    static constexpr int    MIN_PRN         = 1;
+    static constexpr int    MAX_PRN         = 63;
 
-    // ==================== 用户可配置参数 ====================
-    int    prn_number               = 1;              // 卫星PRN编号 (1-63)
-    double sample_rate_hz           = 16.368e6;       // 采样率 (Hz)
-    double intermediate_freq_hz     = 4.092e6;        // 中频 (Hz)，仅实中频模式使用
-    double signal_duration_s        = 1.0;            // 信号时长 (秒)
+    // ==================== 流式调度参数 ====================
+    // 每一块(Chunk)生成的采样点数量。
+    // 建议设为 1024, 2048 或 4096，以适配 CPU 缓存和系统管道(Pipe)缓冲区。
+    int chunk_size = 4096;
 
-    double cn0_dbhz                 = 45.0;           // 载噪比 (dB-Hz)
-    double signal_amplitude         = 1.0;            // 信号幅度 A (归一化)
-    bool   enable_noise             = true;           // 是否添加AWGN噪声
-    uint32_t noise_seed             = 42;             // 噪声随机种子（可复现）
+    // ==================== 卫星与采样基础配置 ====================
+    // 卫星公用 PRN 编号 (1 - 63)
+    int    prn_number               = 1;
+    // 接收机采样频率 (Hz)，例如 16.368 MHz
+    double sample_rate_hz           = 16.368e6;
+    // 数字中频 (Hz)，仅在 OutputMode::REAL_IF 模式下生效
+    double intermediate_freq_hz     = 4.092e6;
 
-    double initial_carrier_phase_rad = 0.0;           // 初始载波相位 (弧度)
-    double initial_code_phase_chips  = 0.0;           // 初始码相位 (chips)
-    double doppler_freq_hz          = 0.0;            // 多普勒频移 (Hz)
-    double doppler_rate_hz_per_s    = 0.0;            // 多普勒变化率 (Hz/s)
+    // ==================== 信号质量与噪声 ====================
+    // 载噪比 C/N0 (dB-Hz)，决定了信号中添加噪声的强度
+    double cn0_dbhz                 = 45.0;
+    // 纯净信号的幅度 A。
+    // 在无噪情况下，实中频信号峰值为 A，复基带信号功率为 A^2
+    double signal_amplitude         = 1.0;
+    // 是否启用 AWGN (高斯白噪声) 叠加
+    bool   enable_noise             = true;
+    // 噪声生成器的随机种子。
+    // 固定此值可以确保在多次运行中生成的噪声序列完全一致，便于调试算法。
+    uint32_t noise_seed             = 42;
 
-    // 前端带宽滤波
-    bool   enable_frontend_filter   = false;          // 是否启用前端带宽滤波
-    double frontend_bandwidth_hz    = 4.092e6;        // 接收机前端带宽 (Hz)
+    // ==================== 初始相位与动态特性 ====================
+    // t=0 时刻的初始载波相位 (弧度, 0 ~ 2π)
+    double initial_carrier_phase_rad = 0.0;
+    // t=0 时刻的初始码相位 (Chips, 0 ~ 2046)
+    double initial_code_phase_chips  = 0.0;
+    // 载波多普勒频移 (Hz)
+    double doppler_freq_hz           = 0.0;
+    // 多普勒变化率 (Hz/s)，用于模拟卫星与接收机间的相对加速度
+    double doppler_rate_hz_per_s     = 0.0;
 
-    // 输出量化
-    SampleFormat sample_format      = SampleFormat::FLOAT32;
-    double quantize_full_scale      = 3.0;            // 量化时的满量程（单位：标准差的倍数）
+    // ==================== 接收机前端滤波 ====================
+    // 是否启用前端带宽限制滤波器 (IIR 差分方程模式)
+    bool   enable_frontend_filter   = false;
+    // 前端低通/带通滤波器的单边带宽 (Hz)。
+    // 例如设为 2.046e6 表示模拟一个约 4MHz 射频带宽的前端。
+    double frontend_bandwidth_hz    = 2.046e6;
 
-    OutputMode     output_mode   = OutputMode::REAL_IF;
-    BdsMessageType message_type  = BdsMessageType::D1;
-
-    // ==================== 辅助计算方法 ====================
-    size_t getTotalSamples() const {
-        return static_cast<size_t>(sample_rate_hz * signal_duration_s + 0.5);
-    }
-
-    double getCodePhaseStep() const {
-        return CODE_RATE_CPS / sample_rate_hz;
-    }
-
-    double getCarrierPhaseStep() const {
-        double total_freq = (output_mode == OutputMode::REAL_IF)
-                           ? (intermediate_freq_hz + doppler_freq_hz)
-                           : doppler_freq_hz;
-        return 2.0 * M_PI * total_freq / sample_rate_hz;
-    }
-
-    double getSymbolRate() const {
-        return (message_type == BdsMessageType::D1)
-               ? D1_SYMBOL_RATE_SPS : D2_SYMBOL_RATE_SPS;
-    }
-
-    size_t getCodePeriodsPerBit() const {
-        return (message_type == BdsMessageType::D1) ? 20 : 2;
-    }
-
-    /**
-     * @brief 信号功率（用于CN0噪声计算）
-     * 复基带 BPSK: C = A^2
-     * 实中频 BPSK: C = A^2 / 2（余弦的时间平均）
-     */
-    double getSignalPower() const {
-        double A = signal_amplitude;
-        return (output_mode == OutputMode::COMPLEX_BASEBAND) ? (A * A) : (A * A / 2.0);
-    }
+    // ==================== 输出模式配置 ====================
+    // 信号输出类型：实中频 或 复基带
+    OutputMode     output_mode  = OutputMode::REAL_IF;
+    // 电文协议类型：D1 或 D2
+    BdsMessageType message_type = BdsMessageType::D1;
 };
 
 } // namespace signal
